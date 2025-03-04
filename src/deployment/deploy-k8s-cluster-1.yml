@@ -1,0 +1,134 @@
+---
+- name: "Phase 1 - Create Cluster and Get IP"
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    app_name: "k8s-ssl"
+    cluster_name: "k8s-ssl-cluster"
+    machine_type: "n2d-standard-2"
+    machine_disk_size: 30
+    initial_node_count: 2
+    letsencrypt_email: "shivasj@gmail.com"
+    domain_name: "k8s.dlops.io"
+  
+  tasks:
+  - name: "Create a GKE cluster"
+    google.cloud.gcp_container_cluster:
+      name: "{{cluster_name}}"
+      initial_node_count: "{{ initial_node_count }}"
+      location: "{{ gcp_zone }}"
+      project: "{{ gcp_project }}"
+      release_channel:
+        channel: "STABLE"
+      ip_allocation_policy:
+        use_ip_aliases: "yes"
+      auth_kind: "{{ gcp_auth_kind }}"
+      service_account_file: "{{ gcp_service_account_file }}"
+      state: "{{ cluster_state }}"
+    register: cluster
+  
+  - name: "Create a Node Pool"
+    google.cloud.gcp_container_node_pool:
+      name: main-pool
+      initial_node_count: "{{ initial_node_count }}"
+      cluster: "{{ cluster }}"
+      location: "{{ gcp_zone }}"
+      project: "{{ gcp_project }}"
+      config:
+        machine_type: "{{ machine_type }}"
+        image_type: "cos_containerd"
+        disk_size_gb: "{{ machine_disk_size }}"
+        oauth_scopes:
+          - "https://www.googleapis.com/auth/devstorage.read_only"
+          - "https://www.googleapis.com/auth/logging.write"
+          - "https://www.googleapis.com/auth/monitoring"
+          - "https://www.googleapis.com/auth/servicecontrol"
+          - "https://www.googleapis.com/auth/service.management.readonly"
+          - "https://www.googleapis.com/auth/trace.append"
+      autoscaling:
+        enabled: "yes"
+        min_node_count: "1"
+        max_node_count: "{{ initial_node_count }}"
+      management:
+        auto_repair: "yes"
+        auto_upgrade: "yes"
+      auth_kind: "{{ gcp_auth_kind }}"
+      service_account_file: "{{ gcp_service_account_file }}"
+      state: "{{ cluster_state }}"
+  
+  - name: "Connect to cluster (update kubeconfig)"
+    shell: "gcloud container clusters get-credentials {{ cluster.name }} --zone {{ gcp_zone }} --project {{ gcp_project }}"
+    when: cluster_state == "present"
+
+  - name: "Create Namespace"
+    k8s:
+      name: "{{cluster_name}}-namespace"
+      api_version: v1
+      kind: Namespace
+      state: present
+    when: cluster_state == "present"
+
+  - name: "Add nginx-ingress helm repo"
+    community.kubernetes.helm_repository:
+      name: nginx-stable
+      repo_url: https://helm.nginx.com/stable
+    when: cluster_state == "present"
+
+  - name: "Install nginx-ingress"
+    community.kubernetes.helm:
+      name: nginx-ingress
+      namespace: "{{cluster_name}}-namespace"
+      chart_ref: nginx-stable/nginx-ingress
+      state: present
+      values:
+        controller:
+          service:
+            annotations:
+              cloud.google.com/load-balancer-type: "External"
+    when: cluster_state == "present"
+  
+  - name: "Wait for Ingress Nginx to get ready"
+    shell: |
+      #!/bin/bash
+      kubectl get service nginx-ingress-controller --namespace="{{cluster_name}}-namespace" -ojson | jq -r '.status.loadBalancer.ingress[].ip'
+    register: nginx_ingress
+    delay: 10
+    retries: 20
+    until: nginx_ingress.stderr == ""
+    when: cluster_state == "present"
+
+  - name: Set Nginx Ingress IP
+    set_fact:
+      nginx_ingress_ip: "{{nginx_ingress.stdout}}"
+    when: cluster_state == "present"
+
+  - name: "Save LoadBalancer IP for phase 2"
+    copy:
+      content: "{{ nginx_ingress_ip }}"
+      dest: ".nginx_ip"
+    when: cluster_state == "present"
+
+  - name: "Display DNS Configuration Instructions"
+    debug:
+      msg: |
+        Phase 1 Complete! DNS Configuration Instructions:
+        
+        1. Configure DNS A Record:
+           Domain: {{ domain_name }}
+           IP Address: {{ nginx_ingress_ip }}
+        
+        2. Add these records to your DNS provider:
+           Type: A
+           Name: {{ domain_name }}
+           Value: {{ nginx_ingress_ip }}
+           TTL: 300
+        
+        3. Verify DNS propagation before running Phase 2:
+           Run: dig {{ domain_name }} +short
+           Expected result should show: {{ nginx_ingress_ip }}
+        
+        4. Wait for DNS propagation (usually 5-60 minutes)
+        
+        5. After DNS is propagated, proceed with Phase 2 deployment
+    when: cluster_state == "present"
